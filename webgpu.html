@@ -1,0 +1,261 @@
+<html>
+    <body>
+        <canvas id="pg_canvas" width="300" height="300" style="border: 1px solid red;"></canvas>
+        <script>
+            window.addEventListener( "load", _ => init());
+
+            let ANGLE = 0, ubo, shader, mesh;
+
+            async function init() {
+                await Api.init();
+
+                ubo    = new Ubo();
+                shader = Shader.mk( SRC_VERT, SRC_FRAG, ubo);
+                mesh   = Mesh.mk( new Float32Array([0.0, 0.5, -0.5, -0.5, 0.5, -0.5]) );
+                
+                render();
+            }
+
+            const POSITION_LOC = 0;
+            const UNIFORM_BIND = 0;
+
+            function render() {
+                ubo.update( ANGLE += 0.01);
+
+                Api.render_begin();
+
+                Api.pass_encoder.setPipeline( shader.pipe_line );
+                Api.pass_encoder.setBindGroup( UNIFORM_BIND, ubo.bind_group );
+                Api.pass_encoder.setVertexBuffer( POSITION_LOC, mesh.buf_vert );
+                Api.pass_encoder.draw( mesh.elm_cnt, 1, 0, 0);
+
+                Api.render_end();
+
+                window.requestAnimationFrame( render );
+            }
+
+            class Api {
+
+                // INITIATE THE GRAPHICS API
+                static async init( canvas_id="pg_canvas" ) {
+                    // Compile GLSL into SPIR-V
+                    // There is no shader language for WEBGPU right now
+                    // , so we need to compile our GLSL shader to SPIR-V bytecode.
+                    // So we need to download the GLSL Compiler
+                    let glslang = await import("https://unpkg.com/@webgpu/glslang@0.0.9/dist/web-devel/glslang.js");
+
+                    // An adapter is logical layer between the API and the GPU. It
+                    // contains the physical device and the metadata of that particular GPU.
+                    this.adapter = await navigator.gpu.requestAdapter();
+
+                    // The device tells us which API must be provided to communicate and query
+                    // with the physical device.
+                    this.device = await this.adapter.requestDevice();
+
+                    this.glsl   = await glslang.default();
+
+                    // The render target in the web browser is
+                    // a HTML canvas. We get a context from the canvas
+                    // by supplying gpupresent
+                    this.canvas = document.getElementById(canvas_id);
+                    this.ctx    = this.canvas.getContext( "gpupresent" );
+
+                    // Swapchain
+                    this.swap_chain = this.ctx.configureSwapChain({
+                        device : this.device,
+                        format : this.tex_format,
+                    });
+                    
+                    // DepthBuffer
+                    this.depth_buffer = this.device.createTexture({
+                        size: { width: 300, height: 300, depth: 1 },
+                        format: Api.depth_format,
+                        usage: GPUTextureUsage.OUTPUT_ATTACHMENT
+                    });
+                 }
+            
+                static render_begin() {
+                    
+                    this.cmd_encoder = this.device.createCommandEncoder( {} );
+
+                    this.render_pass_descriptor
+                            .colorAttachments[0]
+                            .attachment = this.swap_chain.getCurrentTexture().createView();
+
+                    this.render_pass_descriptor
+                            .depthStencilAttachment
+                            .attachment = Api.depth_buffer.createView();
+
+                    this.pass_encoder = this.cmd_encoder.beginRenderPass( this.render_pass_descriptor );
+                }
+
+                static render_end() {
+
+                    Api.pass_encoder.endPass();
+
+                    this.device
+                            .defaultQueue
+                            .submit([ this.cmd_encoder.finish() ]);
+
+                    this.cmd_encoder = null;
+                    this.pass_encoder = null;
+                }
+            }
+
+            Api.canvas       = null;
+            Api.ctx          = null;
+            Api.adapter      = null;
+            Api.device       = null;
+            Api.compiler     = null;
+            Api.swap_chain   = null;
+                 
+            Api.cmd_encoder  = null;
+            Api.pass_encoder = null;
+
+            Api.bg_color = { r:1.0, g:1.0, b:1.0, a:1.0 };
+
+            Api.tex_format = "rgba8unorm";
+            Api.depth_format = "depth24plus-stencil8";
+
+            Api.depth_buffer = null;
+
+            Api.render_pass_descriptor = {
+                colorAttachments: [{
+                    attachment : null,
+                    loadValue  : Api.bg_color
+                }]
+
+                ,depthStencilAttachment:{
+                    attachment: null,
+                    depthLoadValue: 1.0,
+                    depthStoreOp: "store",
+                    stencilLoadValue: 0,
+                    stencilStoreOp: "store"
+                    }
+                }
+                 
+            class Ubo {
+                constructor() {
+                     let gl = Api.ctx;
+
+                     this.data     = new Float32Array( [0, 0, 0, 0] );
+
+                     this.buf      = Api.device.createBuffer({
+                            size   : 16,
+                            usage  : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                     });
+
+                     this.bind_layout = Api.device.createBindGroupLayout({ bindings:[
+                            { binding: 0, visibility: GPUShaderStage.VERTEX, type: "uniform-buffer" }
+                     ]});
+
+                     this.bind_group = Api.device.createBindGroup({
+                        layout          : this.bind_layout,
+                        bindings        : [{ binding:0, resource:{ buffer:this.buf } }]
+                     });
+                }
+
+                update( v ) {
+                    this.data[ 0 ] = v;
+                    this.buf.setSubData(0, this.data );
+                }
+            }
+
+            class Shader {
+                constructor() {
+                    this.pipe_line = null;
+                }
+
+                static mk( vert_src, frag_src, ubo ) {
+                    let byte_vert = Api.glsl.compileGLSL( vert_src, "vertex" ),
+                        byte_frag = Api.glsl.compileGLSL( frag_src, "fragment" ),
+
+                        mod_vert = {
+                            module : Api.device.createShaderModule({ code: byte_vert }),
+                            entryPoint: "main"
+                        },
+
+                        mod_frag = {
+                            module : Api.device.createShaderModule({ code: byte_frag }),
+                            entryPoint: "main"
+                        };
+
+                    let pl_layout = Api.device.createPipelineLayout({ bindGroupLayouts:[ ubo.bind_layout ]});
+
+                    let pipe_line = Api.device.createRenderPipeline({
+                        layout            : pl_layout,
+                        vertexStage       : mod_vert,
+                        fragmentStage     : mod_frag,
+                        primitiveTopology : "triangle-list",
+
+                        colorStates: [ { format: Api.tex_format } ],
+                        depthStencilState : {
+                            depthWriteEnabled : true,
+                            depthCompare      : "less",
+                            format            : Api.depth_format
+                        },
+                        vertexState : {
+                            vertexBuffers : [
+                                {
+                                    arrayStride : 8,
+                                    attributes  : [{
+                                        shaderLocation : 0, offset : 0, format : "float2"
+                                    }]
+                                }
+                            ]
+                        }
+                    });
+
+                    let shader = new Shader();
+                    shader.pipe_line = pipe_line;
+                    return shader;
+                }
+            }
+
+            class Mesh {
+                constructor() {
+                    this.buf_vert = null;
+                    this.elm_cnt  = 0;
+                }
+
+                static mk( vert_ary, elm_len=2 ) {
+                    let mesh = new Mesh();
+
+                    mesh.buf_vert = Api.device.createBuffer({
+                        size  : vert_ary.byteLength,
+                        usage : GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                    });
+
+                    mesh.buf_vert.setSubData( 0, vert_ary );
+                    mesh.elm_cnt = vert_ary.length / elm_len;
+
+                    return mesh;
+                }
+            }
+
+            const SRC_VERT = `#version 450
+                layout(location = 0) in vec2 position;
+
+                layout(set = 0, binding = 0) uniform Uniforms {
+                    float angle;
+                } uniforms;
+
+                vec2 vec2_rot( vec2 v, float a) {
+                    float s = sin( a );
+                    float c = cos( a );
+                    return vec2( v.x * c - v.y * s, v.x * s + v.y * c);
+                }
+
+                void main() {
+                    gl_Position = vec4( vec2_rot( position, uniforms.angle ), 0.0, 1.0 );
+                }`;
+
+            const SRC_FRAG = `#version 450
+                layout(location = 0) out vec4 outColor;
+                
+                void main() {
+                    outColor = vec4(1.0, 0.0, 0.0, 1.0);
+                }`; 
+        </script>
+    </body>
+</html>
